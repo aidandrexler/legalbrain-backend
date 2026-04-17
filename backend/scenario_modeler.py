@@ -1,3 +1,5 @@
+import math
+import random
 from dataclasses import dataclass
 
 BADGE_WEIGHTS = {
@@ -115,3 +117,32 @@ def run_red_flag_check(client_data: dict, tenant_rules: list) -> list:
                 "condition_field": field,
             })
     return triggered
+
+
+def run_grat_analysis(client_data: dict, rate_7520: float) -> dict:
+    asset_value = float(client_data.get("estate_size_estimate") or 1000000)
+    mean_return = 0.06
+    volatility = 0.15
+    simulations = 1000
+    results = []
+    for _ in range(simulations):
+        value = asset_value
+        annual_payment = asset_value * (rate_7520 / 100)
+        for year in range(2):
+            annual_return = random.gauss(mean_return, volatility)
+            value = value * (1 + annual_return) - annual_payment
+        results.append(max(value, 0))
+    results.sort()
+    p10 = results[int(simulations * 0.10)]
+    median = results[int(simulations * 0.50)]
+    p90 = results[int(simulations * 0.90)]
+    zeroed_out_feasible = rate_7520 < mean_return * 100
+    return {
+        "p10": round(p10, 2),
+        "median": round(median, 2),
+        "p90": round(p90, 2),
+        "zeroed_out_feasible": zeroed_out_feasible,
+        "optimal_term_years": 2,
+        "rate_7520_used": rate_7520,
+        "asset_value": asset_value,
+    }
