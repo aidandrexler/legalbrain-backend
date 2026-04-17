@@ -146,3 +146,67 @@ def run_grat_analysis(client_data: dict, rate_7520: float) -> dict:
         "rate_7520_used": rate_7520,
         "asset_value": asset_value,
     }
+
+
+def run_all_scenarios(client_data: dict) -> dict:
+    estate = float(client_data.get("estate_size_estimate") or 0)
+    is_physician = client_data.get("is_physician", False)
+    trust_funded = client_data.get("trust_funded", False)
+    entity_type = client_data.get("practice_entity_type") or client_data.get("entity_type") or ""
+    homestead = client_data.get("homestead_declared", False)
+    payer_pct = float(client_data.get("top_3_payer_concentration_pct") or 0)
+
+    def assess(asset_protected, threat):
+        if asset_protected:
+            return "T5 — Protected"
+        elif estate < threat * 0.5:
+            return "T2 — 30 days"
+        elif estate < threat:
+            return "T3 — 6 months"
+        else:
+            return "T4 — 1-2 years"
+
+    scenario_a = {
+        "name": "Nuclear Verdict ($3-5M judgment)",
+        "what_breaks_first": "Unprotected liquid assets, unfunded trust assets" if not trust_funded else "Non-exempt assets outside trust",
+        "what_survives": "Homestead (if declared), retirement accounts (ERISA/IRA), funded trust assets",
+        "time_to_failure": assess(trust_funded and homestead, 3000000),
+        "pa_gap_flag": "PA entity provides ZERO charging order protection" if "PA" in entity_type.upper() else None,
+    }
+
+    scenario_b = {
+        "name": "Payer Audit + Recoupment Clawback",
+        "what_breaks_first": "Practice operating accounts, accounts receivable" if is_physician else "N/A",
+        "what_survives": "Personal assets if practice properly segregated",
+        "time_to_failure": "T1 — Immediate" if (is_physician and payer_pct > 70) else "T3 — 6 months",
+        "payer_concentration_flag": f"Top 3 payers = {payer_pct}% of revenue — CRITICAL" if payer_pct > 70 else None,
+    }
+
+    scenario_c = {
+        "name": "Business Failure + Personal Guarantee Called",
+        "what_breaks_first": "Personal assets pledged as guarantee collateral",
+        "what_survives": "Homestead, retirement accounts, assets with no guarantee",
+        "time_to_failure": assess(not client_data.get("has_personal_guarantee"), estate * 0.3),
+    }
+
+    scenario_d = {
+        "name": "Divorce — Equitable Distribution",
+        "what_breaks_first": "Marital assets, jointly titled property, commingled trust assets",
+        "what_survives": "Separate property maintained with clean title, pre-marital assets with tracing",
+        "time_to_failure": "T3 — 6 months" if client_data.get("divorce_risk_flag") else "T5 — Not applicable",
+    }
+
+    scenario_e = {
+        "name": "IRS Audit + Back Taxes + Tax Liens",
+        "what_breaks_first": "Non-exempt assets subject to federal tax lien (supersedes most state exemptions)",
+        "what_survives": "Qualified retirement accounts (partial), homestead (partial — IRS can force sale)",
+        "time_to_failure": "T3 — 6 months",
+    }
+
+    return {
+        "scenario_a": scenario_a,
+        "scenario_b": scenario_b,
+        "scenario_c": scenario_c,
+        "scenario_d": scenario_d,
+        "scenario_e": scenario_e,
+    }
