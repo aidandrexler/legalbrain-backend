@@ -81,3 +81,37 @@ def compute_fraud_badges(client_data: dict) -> BadgeResult:
         classification=classification,
         claude_input=claude_input,
     )
+
+
+RED_FLAG_RULES: list = []  # populated from extraction_rules table at runtime
+
+
+def run_red_flag_check(client_data: dict, tenant_rules: list) -> list:
+    triggered = []
+    all_rules = RED_FLAG_RULES + (tenant_rules or [])
+    for rule in all_rules:
+        field = rule.get("condition_field")
+        operator = rule.get("condition_operator", "equals")
+        value = rule.get("condition_value")
+        client_value = client_data.get(field)
+        triggered_flag = False
+        if operator == "equals" and str(client_value) == str(value):
+            triggered_flag = True
+        elif operator == "greater_than" and client_value and float(client_value) > float(value):
+            triggered_flag = True
+        elif operator == "less_than" and client_value and float(client_value) < float(value):
+            triggered_flag = True
+        elif operator == "is_true" and client_value is True:
+            triggered_flag = True
+        elif operator == "is_false" and client_value is False:
+            triggered_flag = True
+        elif operator == "contains" and value and str(value).lower() in str(client_value or "").lower():
+            triggered_flag = True
+        if triggered_flag:
+            triggered.append({
+                "flag": rule.get("flag_level", "HIGH"),
+                "message": rule.get("alert_message", ""),
+                "citation": rule.get("citations", []),
+                "condition_field": field,
+            })
+    return triggered
