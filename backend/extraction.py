@@ -396,6 +396,81 @@ def chunk_and_ingest(bundle: dict, job_id: str, tenant_id: str, openai_key: str)
     return total_inserted
 
 
+# ── Conflict detection ───────────────────────────────────────────────────────
+
+def run_conflict_detection(
+    tenant_id: str,
+    new_chunk_ids: list[str],
+    confidence_tier: int,
+    source_title: str,
+) -> int:
+    """
+    For each new chunk, find similar existing chunks (cosine > 0.85) and ask Claude
+    whether the new text contradicts or supersedes the old text. Marks superseded
+    chunks with is_superseded=True.
+    Returns count of chunks marked superseded.
+    """
+    sb = get_supabase()
+    keys = get_tenant_keys(tenant_id)
+    anthropic_key = keys.get("anthropic_api_key")
+    if not anthropic_key or not new_chunk_ids:
+        return 0
+
+    client = anthropic.Anthropic(api_key=anthropic_key)
+    superseded_count = 0
+
+    for chunk_id in new_chunk_ids:
+        try:
+            new_row = (
+                sb.table("legal_knowledge")
+                .select("content, embedding")
+                .eq("id", chunk_id)
+                .single()
+                .execute()
+            )
+            if not new_row.data:
+                continue
+            new_content = new_row.data["content"]
+            new_embedding = new_row.data["embedding"]
+
+            similar = sb.rpc("hybrid_search_legal", {
+                "p_tenant_id": tenant_id,
+                "query_text": new_content[:500],
+                "query_embedding": new_embedding,
+                "match_count": 5,
+                "alpha": 1.0,
+                "beta": 0.0,
+            }).execute()
+
+            for existing in (similar.data or []):
+                if existing["id"] == chunk_id:
+                    continue
+                if (existing.get("hybrid_score") or 0) < 0.85:
+                    continue
+
+                response = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=10,
+                    messages=[{"role": "user", "content": (
+                        f"Old text:\n{existing['content']}\n\n"
+                        f"New text:\n{new_content}\n\n"
+                        f"Does the new text directly contradict or update the old text? "
+                        f"Answer YES or NO only."
+                    )}],
+                )
+                if response.content[0].text.strip().upper().startswith("YES"):
+                    sb.table("legal_knowledge").update({
+                        "is_superseded": True,
+                        "superseded_by": f"{chunk_id} — Superseded by: {source_title}",
+                    }).eq("id", existing["id"]).execute()
+                    superseded_count += 1
+
+        except Exception as exc:
+            logger.warning("Conflict check failed for chunk %s: %s", chunk_id, exc)
+
+    return superseded_count
+
+
 # ── Main orchestrator ────────────────────────────────────────────────────────
 
 async def process_job(job_id: str) -> None:
@@ -426,6 +501,11 @@ async def process_job(job_id: str) -> None:
             raw_text = extract_text_from_pdf(job["storage_path"], tenant_id)
             sb.table("extraction_jobs").update(
                 {"raw_text": raw_text, "updated_at": datetime.now(timezone.utc).isoformat()}
+            ).eq("id", job_id).execute()
+            # Delete source file immediately after text is extracted
+            sb.storage.from_("sources").remove([job["storage_path"]])
+            sb.table("extraction_jobs").update(
+                {"storage_path": None, "updated_at": datetime.now(timezone.utc).isoformat()}
             ).eq("id", job_id).execute()
 
         if not raw_text:
@@ -469,6 +549,35 @@ async def process_job(job_id: str) -> None:
         # Stage 7 — chunk and ingest into pgvector
         update("ingesting", 85, "Generating embeddings and ingesting into knowledge base...")
         chunks_created = chunk_and_ingest(bundle, job_id, tenant_id, openai_key)
+
+        # Conflict detection against existing knowledge base
+        try:
+            new_chunks_result = (
+                sb.table("legal_knowledge")
+                .select("id")
+                .eq("extraction_job_id", job_id)
+                .execute()
+            )
+            new_chunk_ids = [row["id"] for row in (new_chunks_result.data or [])]
+            run_conflict_detection(
+                tenant_id, new_chunk_ids, job.get("confidence_tier", 2), job["source_title"]
+            )
+        except Exception as exc:
+            logger.warning("Conflict detection failed: %s", exc)
+
+        # Telemetry
+        try:
+            sb.table("telemetry_events").insert({
+                "event_type": "extraction_complete",
+                "metadata": {
+                    "source_type": job["source_type"],
+                    "confidence_tier": job.get("confidence_tier", 2),
+                    "chunks_created": chunks_created,
+                    "jurisdiction": job.get("jurisdiction", "FL"),
+                },
+            }).execute()
+        except Exception as exc:
+            logger.warning("Telemetry insert failed: %s", exc)
 
         update("complete", 100, "Extraction complete.", chunks_created=chunks_created)
         logger.info("Job %s complete — %d chunks ingested.", job_id, chunks_created)

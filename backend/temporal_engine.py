@@ -288,4 +288,15 @@ def run_temporal_engine(supabase_client, tenant_id: str, client_id: Optional[str
                 "due_date": due_date,
             }).execute()
 
+    try:
+        supabase_client.table("telemetry_events").insert({
+            "event_type": "temporal_scan",
+            "metadata": {
+                "clients_checked": summary["clients_checked"],
+                "windows_found": summary["windows_found"],
+            },
+        }).execute()
+    except Exception as exc:
+        logger.warning("Telemetry insert failed: %s", exc)
+
     return summary

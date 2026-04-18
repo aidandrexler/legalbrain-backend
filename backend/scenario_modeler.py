@@ -116,6 +116,20 @@ def run_red_flag_check(client_data: dict, tenant_rules: list) -> list:
                 "citation": rule.get("citations", []),
                 "condition_field": field,
             })
+
+    if triggered:
+        try:
+            from main import get_supabase
+            _severity = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+            highest = min(triggered, key=lambda f: _severity.get(f["flag"], 99))["flag"]
+            get_supabase().table("telemetry_events").insert({
+                "event_type": "red_flag_triggered",
+                "flag_level": highest,
+                "jurisdiction": client_data.get("jurisdiction", "FL"),
+            }).execute()
+        except Exception:
+            pass
+
     return triggered
 
 

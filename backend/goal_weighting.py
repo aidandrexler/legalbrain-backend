@@ -221,6 +221,15 @@ def compute_topsis(client_data: dict, goal_weights: dict) -> TOPSISResult:
             "reasoning": _build_reasoning(key, strategy_scores, weights, closeness[idx], rank),
         })
 
+    try:
+        from main import get_supabase
+        get_supabase().table("telemetry_events").insert({
+            "event_type": "strategy_ranked_top",
+            "strategy_key": ranked_strategies[0]["strategy_key"] if ranked_strategies else None,
+        }).execute()
+    except Exception:
+        pass
+
     return TOPSISResult(
         ranked_strategies=ranked_strategies,
         goal_weights=weights,
