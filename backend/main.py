@@ -640,3 +640,75 @@ async def intelligence_digest(tenant_id: str):
     anthropic_key = get_tenant_anthropic_key(tenant)
     result = await run_intelligence_digest(tenant_id, anthropic_key)
     return {"success": True, **result}
+
+
+# ── OAUTH ENDPOINTS ──────────────────────────────────────────────────────────
+
+from fastapi.responses import RedirectResponse
+
+
+@app.get("/api/v1/oauth/clio/connect")
+async def clio_connect(tenant_id: str):
+    from oauth import get_clio_authorize_url
+    url = get_clio_authorize_url(tenant_id)
+    return RedirectResponse(url=url)
+
+
+@app.get("/api/v1/oauth/clio/callback")
+async def clio_callback(code: str, state: str):
+    import requests as req_lib
+    from oauth import store_oauth_token
+    APP_URL = os.environ.get("APP_URL", "")
+    resp = req_lib.post(
+        "https://app.clio.com/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": os.environ.get("CLIO_CLIENT_ID", ""),
+            "client_secret": os.environ.get("CLIO_CLIENT_SECRET", ""),
+            "redirect_uri": f"{APP_URL}/api/v1/oauth/clio/callback",
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=400, detail="Clio OAuth failed")
+    store_oauth_token(state, "clio", resp.json())
+    return RedirectResponse(url=f"{APP_URL}/settings?connected=clio")
+
+
+@app.get("/api/v1/oauth/leap/connect")
+async def leap_connect(tenant_id: str):
+    from oauth import get_leap_authorize_url
+    url = get_leap_authorize_url(tenant_id)
+    return RedirectResponse(url=url)
+
+
+@app.get("/api/v1/oauth/leap/callback")
+async def leap_callback(code: str, state: str):
+    import requests as req_lib
+    from oauth import store_oauth_token
+    APP_URL = os.environ.get("APP_URL", "")
+    resp = req_lib.post(
+        "https://api.leapaws.com/oauth2/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": os.environ.get("LEAP_CLIENT_ID", ""),
+            "client_secret": os.environ.get("LEAP_CLIENT_SECRET", ""),
+            "redirect_uri": f"{APP_URL}/api/v1/oauth/leap/callback",
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=400, detail="LEAP OAuth failed")
+    store_oauth_token(state, "leap", resp.json())
+    return RedirectResponse(url=f"{APP_URL}/settings?connected=leap")
+
+
+# ── SANDBOX PROVISION ENDPOINT ───────────────────────────────────────────────
+
+@app.post("/api/v1/sandbox/provision")
+async def provision_sandbox_endpoint(tenant_id: str):
+    from sandbox import provision_sandbox
+    result = await provision_sandbox(tenant_id)
+    return result
