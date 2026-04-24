@@ -48,6 +48,20 @@ def get_tenant_openai_key(tenant: dict) -> str:
     return key
 
 
+def get_govinfo_key(tenant: dict) -> str:
+    return (tenant.get("govinfo_api_key") or
+            os.environ.get("GOVINFO_API_KEY", ""))
+
+
+def get_courtlistener_token(tenant: dict) -> str:
+    return (tenant.get("courtlistener_token") or
+            os.environ.get("COURTLISTENER_TOKEN", ""))
+
+
+def get_legiscan_key(tenant: dict) -> str:
+    return os.environ.get("LEGISCAN_API_KEY", "")
+
+
 # kept for backwards-compat with modules that import get_tenant_keys
 def get_tenant_keys(tenant_id: str) -> dict:
     tenant = get_tenant(tenant_id)
@@ -314,6 +328,41 @@ Be precise. Cite everything. Do not fabricate citations.""",
 }
 
 
+def check_cta_compliance(client_data: dict) -> list:
+    """
+    Check Corporate Transparency Act BOI filing requirements
+    for all entities in the client profile.
+    Returns list of compliance flags.
+    """
+    flags = []
+    entity_type = client_data.get("entity_type", "")
+    practice_entity = client_data.get("practice_entity_type", "")
+
+    entities = []
+    if entity_type in ["LLC", "PLLC", "PA", "Corp", "FLP"]:
+        entities.append({
+            "name": client_data.get("practice_name") or "Client Entity",
+            "type": entity_type
+        })
+    if practice_entity in ["LLC", "PLLC", "PA"]:
+        entities.append({
+            "name": client_data.get("practice_name") or "Practice Entity",
+            "type": practice_entity
+        })
+
+    for entity in entities:
+        flags.append({
+            "flag_type": "CTA_BOI_REQUIRED",
+            "flag_level": "HIGH",
+            "entity": entity["name"],
+            "entity_type": entity["type"],
+            "message": f"{entity['name']} ({entity['type']}) requires BOI filing under Corporate Transparency Act. Verify filing status immediately.",
+            "action": "Confirm BOI report filed at fincen.gov/boi"
+        })
+
+    return flags
+
+
 @app.post("/api/v1/run")
 async def run_diagnostic(req: DiagnosticRequest):
     from pii_masker import mask_client_data, restore_pii
@@ -364,6 +413,18 @@ async def run_diagnostic(req: DiagnosticRequest):
             .data or []
         )
         red_flags = run_red_flag_check(client_data, tenant_rules)
+        cta_flags = check_cta_compliance(client_data)
+        if cta_flags:
+            if red_flags:
+                red_flags += "\n\nCTA/BOI COMPLIANCE FLAGS:\n" + "\n".join(
+                    f"[{f['flag_level']}] {f['message']} — {f['action']}"
+                    for f in cta_flags
+                )
+            else:
+                red_flags = "CTA/BOI COMPLIANCE FLAGS:\n" + "\n".join(
+                    f"[{f['flag_level']}] {f['message']} — {f['action']}"
+                    for f in cta_flags
+                )
 
         mask_result = mask_client_data(str(client_data))
 
@@ -596,6 +657,41 @@ async def ingest_knowledge(req: IngestRequest):
     ]
     get_supabase().table("legal_knowledge").insert(rows).execute()
     return {"success": True, "chunks_created": len(rows), "source_id": req.source_id}
+
+
+@app.post("/api/v1/admin/seed-global")
+async def seed_global_knowledge(req: IngestRequest, admin_key: str = Header(None)):
+    if admin_key != os.environ.get("ADMIN_SECRET_KEY", ""):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    req.is_global = True
+    return await ingest_knowledge(req)
+
+
+@app.get("/api/v1/admin/global-chunks")
+async def list_global_chunks(admin_key: str = Header(None)):
+    if admin_key != os.environ.get("ADMIN_SECRET_KEY", ""):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    result = get_supabase().table("legal_knowledge")\
+        .select("id, source_title, namespace, confidence_tier, ingested_at")\
+        .eq("is_global", True)\
+        .eq("is_superseded", False)\
+        .order("ingested_at", desc=True)\
+        .execute()
+    return {"chunks": result.data, "total": len(result.data)}
+
+
+@app.post("/api/v1/admin/promote-extraction")
+async def promote_extraction_to_global(
+    extraction_job_id: str,
+    admin_key: str = Header(None)
+):
+    if admin_key != os.environ.get("ADMIN_SECRET_KEY", ""):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    result = get_supabase().table("legal_knowledge")\
+        .update({"is_global": True})\
+        .eq("extraction_job_id", extraction_job_id)\
+        .execute()
+    return {"success": True, "chunks_promoted": len(result.data)}
 
 
 # ── ENDPOINT 7: TEMPORAL ─────────────────────────────────────────────────────
