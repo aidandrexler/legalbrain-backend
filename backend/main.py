@@ -105,6 +105,7 @@ class IngestRequest(BaseModel):
     source_type: str
     citation: str
     replaces_source: Optional[str] = None
+    is_global: bool = False
 
 
 class TemporalRequest(BaseModel):
@@ -393,6 +394,34 @@ async def run_diagnostic(req: DiagnosticRequest):
                 r["final_rule"] for r in approved_rules if r.get("final_rule")
             )
 
+        # Pre-flight KB retrieval — grounds diagnostic in extracted knowledge
+        try:
+            import requests as _req_lib
+            _embed_resp = _req_lib.post(
+                "https://api.openai.com/v1/embeddings",
+                headers={"Authorization": f"Bearer {get_tenant_openai_key(tenant)}",
+                         "Content-Type": "application/json"},
+                json={"model": "text-embedding-3-small",
+                      "input": f"{req.diagnostic_type} {str(client_data)[:400]}"},
+                timeout=15,
+            )
+            _kb = get_supabase().rpc("hybrid_search_legal", {
+                "p_tenant_id": req.tenant_id,
+                "query_text": req.diagnostic_type,
+                "query_embedding": _embed_resp.json()["data"][0]["embedding"],
+                "match_count": 10,
+                "filter_namespaces": None,
+            }).execute()
+            _chunks = _kb.data or []
+            if _chunks:
+                _ctx = "\n\n".join(
+                    f"[{c['namespace'].upper()} — {c['citation']}]\n{c['content']}"
+                    for c in _chunks
+                )
+                system_prompt += f"\n\nEXTRACTED KNOWLEDGE BASE — GROUND YOUR ANALYSIS IN THIS:\n{_ctx}"
+        except Exception as _kb_err:
+            log.warning(f"KB retrieval failed (non-fatal): {_kb_err}")
+
         ai_client = anthropic.Anthropic(api_key=anthropic_key)
         response = ai_client.messages.create(
             model="claude-sonnet-4-6",
@@ -411,6 +440,26 @@ async def run_diagnostic(req: DiagnosticRequest):
             "scenario_result": scenario_result,
             "tokens_used": response.usage.input_tokens + response.usage.output_tokens,
         }).eq("id", diag_id).execute()
+
+        # Auto-create action items from drafting spec
+        try:
+            _spec = diag_result.get("drafting_spec") if isinstance(diag_result, dict) else None
+            _tasks = (_spec or {}).get("implementation_tasks", [])
+            for _task in _tasks:
+                get_supabase().table("action_items").insert({
+                    "tenant_id": req.tenant_id,
+                    "client_id": req.client_id,
+                    "title": _task.get("task", ""),
+                    "urgency": _task.get("criticality", "MEDIUM"),
+                    "description": _task.get("document_needed", ""),
+                    "source": "diagnostic",
+                    "due_date": (datetime.date.today() + datetime.timedelta(
+                        days=_task.get("timeline_days", 30)
+                    )).isoformat(),
+                    "status": "open",
+                }).execute()
+        except Exception as _ai_err:
+            log.warning(f"Action item creation failed (non-fatal): {_ai_err}")
 
         try:
             get_supabase().table("telemetry_events").insert({
@@ -541,7 +590,7 @@ async def ingest_knowledge(req: IngestRequest):
             "source_type": req.source_type,
             "citation": req.citation,
             "is_superseded": False,
-            "is_global": False,
+            "is_global": req.is_global,
         }
         for chunk, emb in zip(chunks, embeddings)
     ]
